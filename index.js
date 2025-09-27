@@ -4,22 +4,24 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// Load credentials from environment variables (set these on Render)
-const PAYU_CLIENT_ID = process.env.PAYU_CLIENT_ID;
-const PAYU_CLIENT_SECRET = process.env.PAYU_CLIENT_SECRET;
-const PAYU_POS_ID = process.env.PAYU_POS_ID;
-const PAYU_SECOND_KEY = process.env.PAYU_SECOND_KEY;
-const PAYU_API_URL = process.env.PAYU_API_URL || "https://secure.snd.payu.com"; // Sandbox by default
+// Load environment variables
+const {
+  PAYU_CLIENT_ID,
+  PAYU_CLIENT_SECRET,
+  PAYU_POS_ID,
+  PAYU_SECOND_KEY,
+  PAYU_API_URL,
+  ECWID_STORE_ID,
+  ECWID_API_TOKEN
+} = process.env;
 
-// Ecwid variables (used for marking order as PAID)
-const ECWID_STORE_ID = process.env.ECWID_STORE_ID;
-const ECWID_API_TOKEN = process.env.ECWID_API_TOKEN;
-
-// ------------------ STEP 1: Get PayU Access Token ------------------
+// ✅ Function to get OAuth token from PayU
 async function getAccessToken() {
   const response = await fetch(`${PAYU_API_URL}/pl/standard/user/oauth/authorize`, {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
     body: new URLSearchParams({
       grant_type: "client_credentials",
       client_id: PAYU_CLIENT_ID,
@@ -27,15 +29,15 @@ async function getAccessToken() {
     })
   });
 
-  const data = await response.json();
-  if (!data.access_token) {
-    console.error("Failed to get PayU token:", data);
-    throw new Error("Could not get PayU access token");
+  if (!response.ok) {
+    throw new Error(`PayU Auth Failed: ${response.status} ${await response.text()}`);
   }
+
+  const data = await response.json();
   return data.access_token;
 }
 
-// ------------------ STEP 2: Ecwid Calls This Route at Checkout ------------------
+// ✅ Route for Ecwid → PayU order creation
 app.post("/payu", async (req, res) => {
   try {
     const token = await getAccessToken();
@@ -45,29 +47,28 @@ app.post("/payu", async (req, res) => {
       return res.status(400).json({ error: "No order data received from Ecwid" });
     }
 
-    // Convert order total to grosz (PayU uses integer minor units)
+    // Convert total amount to grosz (minor currency unit)
     const totalAmount = Math.round(order.total * 100);
 
-    // Build product list from Ecwid order items
+    // Build product list for PayU
     const products = order.items.map(item => ({
       name: item.name,
       unitPrice: Math.round(item.price * 100),
       quantity: item.quantity
     }));
 
-    // Build PayU order payload
     const orderPayload = {
-      notifyUrl: "https://your-render-app.onrender.com/payu/notify", // Replace with your Render app URL
+      notifyUrl: `${req.protocol}://${req.get("host")}/payu/notify`,
       customerIp: req.ip || "127.0.0.1",
       merchantPosId: PAYU_POS_ID,
       description: `Order #${order.id}`,
-      extOrderId: order.id.toString(), // IMPORTANT for matching payments
+      extOrderId: order.id.toString(), // Used later to update Ecwid order
       currencyCode: order.currency || "PLN",
       totalAmount: totalAmount.toString(),
       products
     };
 
-    const response = await fetch(`${PAYU_API_URL}/api/v2_1/orders`, {
+    const payuResponse = await fetch(`${PAYU_API_URL}/api/v2_1/orders`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -76,36 +77,36 @@ app.post("/payu", async (req, res) => {
       body: JSON.stringify(orderPayload)
     });
 
-    const result = await response.json();
+    const result = await payuResponse.json();
 
-    if (result.status.statusCode === "SUCCESS") {
+    if (result.status?.statusCode === "SUCCESS") {
+      console.log("✅ PayU Order Created:", result);
       return res.json({
-        redirectUrl: result.redirectUri // Ecwid will redirect customer to this URL
+        redirectUrl: result.redirectUri // Ecwid will redirect the customer to this URL
       });
     } else {
-      console.error("PayU order creation failed:", result);
+      console.error("❌ PayU order creation failed:", result);
       return res.status(400).json({ error: result });
     }
   } catch (error) {
-    console.error(error);
+    console.error("🔥 Error creating PayU order:", error);
     res.status(500).json({ error: "Payment initialization failed" });
   }
 });
 
-// ------------------ STEP 3: PayU Calls This Route After Payment ------------------
+// ✅ Webhook route for PayU → Ecwid payment confirmation
 app.post("/payu/notify", async (req, res) => {
   try {
-    console.log("PayU notification received:", req.body);
+    console.log("🔔 PayU notification received:", req.body);
 
     const payuOrder = req.body;
-    const orderId = payuOrder?.order?.extOrderId; // Extract order ID from notification
+    const orderId = payuOrder?.order?.extOrderId;
 
     if (!orderId) {
-      console.error("No order ID found in PayU notification");
+      console.error("❌ No order ID found in PayU notification");
       return res.sendStatus(400);
     }
 
-    // Update order status in Ecwid
     const ecwidApiUrl = `https://app.ecwid.com/api/v3/${ECWID_STORE_ID}/orders/${orderId}/payment_status`;
     const ecwidResponse = await fetch(ecwidApiUrl, {
       method: "PUT",
@@ -113,22 +114,27 @@ app.post("/payu/notify", async (req, res) => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${ECWID_API_TOKEN}`
       },
-      body: JSON.stringify({ paymentStatus: "PAID" })
+      body: JSON.stringify({
+        paymentStatus: "PAID"
+      })
     });
 
     if (!ecwidResponse.ok) {
       const errorText = await ecwidResponse.text();
-      console.error("Failed to update Ecwid order:", errorText);
+      console.error("❌ Failed to update Ecwid order:", errorText);
       return res.sendStatus(500);
     }
 
-    console.log(`Order ${orderId} marked as PAID in Ecwid`);
+    console.log(`✅ Order ${orderId} marked as PAID in Ecwid`);
     res.sendStatus(200);
   } catch (error) {
-    console.error("Error processing PayU notification:", error);
+    console.error("🔥 Error processing PayU notification:", error);
     res.sendStatus(500);
   }
 });
 
-app.listen(3000, () => console.log("Server running on port 3000"));
-
+// ✅ Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 PayU integration server running on port ${PORT}`);
+});
